@@ -1,69 +1,98 @@
 # Twi / Igbo → English live speech translator
 
-A small web app that captures live microphone audio in Twi or Igbo, transcribes
-it with **Meta MMS** (Massively Multilingual Speech, 1000+ languages), and
-translates the transcript to English with **NLLB-200**.
+A small web app that captures live microphone audio in Twi or Igbo,
+transcribes it with **Meta MMS** running on-device, and translates the
+transcript to English using **Claude Haiku 4.5** via the Anthropic API.
 
 ```
-mic → MediaRecorder (5s chunks) → FastAPI /transcribe
+mic → MediaRecorder (15s chunks) → FastAPI /transcribe
                                   → ffmpeg decode (16kHz mono)
-                                  → MMS speech recognition
-                                  → NLLB-200 translation
+                                  → MMS speech recognition (local)
+                                  → Claude Haiku 4.5 translation (API)
                                   → JSON {transcript, translation}
 ```
 
-Browsers don't natively support Twi or Igbo speech recognition (and OpenAI
-Whisper doesn't list them either), so the heavy lifting happens on the
-server.
+Runs entirely on an Android phone using **Termux**: the FastAPI server,
+PyTorch, and the MMS model all run on the phone; the only network call
+goes from the phone to the Anthropic API for translation. Open the page
+in the phone's browser at `http://localhost:8000`.
+
+## Why this stack
+
+- Browsers don't natively support Twi or Igbo speech recognition, and
+  OpenAI Whisper doesn't list either language. **MMS** covers 1100+
+  languages including `twi` and `ibo` and is the only practical free
+  option.
+- Translation could be done with NLLB-200 locally, but Claude Haiku 4.5
+  produces much more natural, context-aware English from a multi-sentence
+  Twi/Igbo transcript — and it's fast enough (typically 0.5–2 s per
+  chunk).
 
 ## Requirements
 
-- Python 3.10+
-- `ffmpeg` on PATH (used to decode the browser's webm/ogg/mp4 audio chunks)
-- ~3 GB of disk for the models (downloaded on first run)
-- A GPU is nice but not required; CPU works, just slower per chunk
+- Android phone with Termux (install from F-Droid; the Play Store build
+  is outdated)
+- ~3 GB free disk for the MMS model + PyTorch
+- An Anthropic API key (set `ANTHROPIC_API_KEY`)
 
-## Setup
+## Termux setup (one-time)
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-# optional: keep the model cache inside the project
-export HF_HOME=$(pwd)/hf_cache
+pkg update && pkg upgrade
+pkg install python ffmpeg git rust binutils
+
+# PyTorch + numpy ship as Termux packages — pip-installing them fails
+# without these.
+pkg install python-torch python-numpy
+
+git clone <this-repo> translator && cd translator
+pip install fastapi 'uvicorn[standard]' python-multipart transformers anthropic
+
+# Keep model downloads inside the project so they're easy to find/delete.
+echo 'export HF_HOME=$HOME/translator/hf_cache' >> ~/.bashrc
+echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 ## Run
 
 ```bash
-uvicorn server:app --host 0.0.0.0 --port 8000
+cd ~/translator
+uvicorn server:app --host 127.0.0.1 --port 8000
 ```
 
-Open <http://localhost:8000>, pick **Twi** or **Igbo**, click **Start**, and
-talk. The left pane shows the original transcript, the right pane shows the
-English translation. The first request triggers a one-time model download
-(~2.5 GB) and warmup.
+Open `http://localhost:8000` in the phone's browser, pick **Twi** or
+**Igbo**, tap **Start**, and talk. The first request triggers a one-time
+MMS download (~2.5 GB) and warmup; subsequent chunks transcribe in a few
+seconds and translate in ~1 second.
+
+The default 15-second chunk gives Claude enough context to produce
+fluent translations across sentence boundaries; drop to 5 s if you'd
+rather see English text appear sooner at the cost of choppier phrasing.
 
 ## Notes & honest limits
 
-- **Low-resource languages.** Twi and Igbo have far less training data than
-  English/Spanish/Mandarin. Expect transcription errors, especially with
-  background noise, multiple speakers, or heavy code-switching.
-- **Near-live, not streaming.** Audio is sent in self-contained 3–8 second
-  chunks (the page restarts the `MediaRecorder` on each interval so each blob
-  has full container headers — required for ffmpeg to decode it). True
-  word-by-word streaming would need a different model architecture (e.g.
-  RNN-T) and a WebSocket protocol.
-- **Models used**
-  - Speech: [`facebook/mms-1b-all`](https://huggingface.co/facebook/mms-1b-all)
-  - Translation: [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M)
-- **Privacy.** Audio leaves the browser to reach your own server; nothing goes
-  to a third-party API.
+- **Low-resource speech recognition.** Twi and Igbo have far less
+  training data than English/Spanish/Mandarin. Expect transcription
+  errors — especially with background noise, multiple speakers, or
+  heavy code-switching. Claude often makes the English readable even
+  when the MMS transcript has minor errors, but garbage in still means
+  garbage out.
+- **Phone CPU is the bottleneck.** MMS is ~1B params; a 15-second clip
+  takes roughly 5–15 s to transcribe on a modern phone. Translation is
+  fast.
+- **Privacy.** Audio never leaves the phone. The Twi/Igbo *transcript*
+  is sent to the Anthropic API for translation — be aware of that if
+  the content is sensitive.
 
 ## Adding more languages
 
-MMS supports 1100+ languages and NLLB supports 200. To add e.g. Yoruba:
+MMS supports 1100+ languages. To add e.g. Yoruba:
 
-1. Add `"yor": "yor"` to `MMS_LANG` in `server.py`
-2. Add `"yor": "yor_Latn"` to `NLLB_SRC`
-3. Add an `<option value="yor">Yoruba</option>` to the `<select id="lang">` in
-   `static/index.html`
+1. Add `"yor": "yor"` to `MMS_LANG` and `"yor": "Yoruba"` to `LANG_NAME`
+   in `server.py`.
+2. Add `<option value="yor">Yoruba</option>` to the `<select id="lang">`
+   in `static/index.html`.
+
+Claude already understands hundreds of languages, so the translation
+side needs no changes.
