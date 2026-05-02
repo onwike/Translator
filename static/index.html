@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Twi / Igbo → English live translator</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --panel-2: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #22d3ee;
+    --accent-2: #f472b6;
+    --danger: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    padding: 24px;
+    border-bottom: 1px solid var(--panel-2);
+  }
+  header h1 { margin: 0 0 4px; font-size: 22px; }
+  header p { margin: 0; color: var(--muted); font-size: 14px; }
+  main {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 24px;
+    display: grid;
+    gap: 20px;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    background: var(--panel);
+    padding: 16px;
+    border-radius: 12px;
+  }
+  label { font-size: 14px; color: var(--muted); }
+  select, button {
+    font: inherit;
+    padding: 10px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--panel-2);
+    background: var(--panel-2);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #0f172a; border-color: var(--accent); font-weight: 600; }
+  button.danger  { background: var(--danger); color: white; border-color: var(--danger); font-weight: 600; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status {
+    margin-left: auto;
+    font-size: 13px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--muted); transition: background 0.2s;
+  }
+  .dot.live { background: var(--danger); animation: pulse 1.2s infinite; }
+  .dot.busy { background: var(--accent); }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
+
+  .panes {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 720px) { .panes { grid-template-columns: 1fr; } }
+  .pane {
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 16px;
+    min-height: 240px;
+    display: flex;
+    flex-direction: column;
+  }
+  .pane h2 {
+    margin: 0 0 8px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  .pane.translation h2 { color: var(--accent); }
+  .pane .body {
+    flex: 1;
+    overflow-y: auto;
+    line-height: 1.5;
+    font-size: 16px;
+    white-space: pre-wrap;
+  }
+  .pane .body p { margin: 0 0 8px; }
+  .pane .body p.partial { color: var(--muted); font-style: italic; }
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+    padding: 16px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Twi / Igbo → English live translator</h1>
+  <p>Speak in Twi or Igbo. Audio is captured in short chunks, transcribed with Meta MMS, and translated with NLLB-200.</p>
+</header>
+
+<main>
+  <div class="controls">
+    <label for="lang">Language</label>
+    <select id="lang">
+      <option value="twi">Twi (Akan)</option>
+      <option value="ibo">Igbo</option>
+    </select>
+
+    <label for="chunk">Chunk size</label>
+    <select id="chunk">
+      <option value="3000">3 s</option>
+      <option value="5000" selected>5 s</option>
+      <option value="8000">8 s</option>
+    </select>
+
+    <button id="start" class="primary">Start</button>
+    <button id="stop"  class="danger" disabled>Stop</button>
+
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="statusText">idle</span>
+    </div>
+  </div>
+
+  <div class="panes">
+    <div class="pane">
+      <h2>Original (Twi/Igbo)</h2>
+      <div class="body" id="original"></div>
+    </div>
+    <div class="pane translation">
+      <h2>English translation</h2>
+      <div class="body" id="english"></div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  Browser must allow microphone access. Twi and Igbo are low-resource languages — accuracy is best with clear speech, one speaker, no background noise.
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const startBtn = $("start"), stopBtn = $("stop");
+const langSel = $("lang"), chunkSel = $("chunk");
+const dot = $("dot"), statusText = $("statusText");
+const originalEl = $("original"), englishEl = $("english");
+
+let mediaStream = null;
+let recorder = null;
+let chunkTimer = null;
+let inflight = 0;
+
+function setStatus(text, kind) {
+  statusText.textContent = text;
+  dot.className = "dot" + (kind ? " " + kind : "");
+}
+
+function appendLine(el, text) {
+  if (!text) return;
+  const p = document.createElement("p");
+  p.textContent = text;
+  el.appendChild(p);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function sendChunk(blob) {
+  if (!blob || blob.size < 1000) return;
+  inflight++;
+  setStatus(`processing (${inflight})…`, "busy");
+  const fd = new FormData();
+  fd.append("audio", blob, "chunk.webm");
+  fd.append("lang", langSel.value);
+  try {
+    const res = await fetch("/transcribe", { method: "POST", body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    appendLine(originalEl, data.transcript);
+    appendLine(englishEl, data.translation);
+  } catch (err) {
+    console.error(err);
+    appendLine(englishEl, "[error: " + err.message + "]");
+  } finally {
+    inflight--;
+    setStatus(recorder && recorder.state === "recording"
+      ? (inflight ? `processing (${inflight})…` : "listening…")
+      : "idle",
+      recorder && recorder.state === "recording"
+        ? (inflight ? "busy" : "live")
+        : null);
+  }
+}
+
+function pickMimeType() {
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+  for (const t of candidates) {
+    if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return "";
+}
+
+async function start() {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    setStatus("mic denied", null);
+    alert("Could not access microphone: " + err.message);
+    return;
+  }
+  const mimeType = pickMimeType();
+  const chunkMs = parseInt(chunkSel.value, 10);
+  let parts = [];
+
+  const newRecorder = () => {
+    const r = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
+    r.ondataavailable = (e) => { if (e.data && e.data.size) parts.push(e.data); };
+    r.onstop = () => {
+      if (parts.length) {
+        const blob = new Blob(parts, { type: parts[0].type || mimeType || "audio/webm" });
+        parts = [];
+        sendChunk(blob);
+      }
+    };
+    return r;
+  };
+
+  recorder = newRecorder();
+  recorder.start();
+  setStatus("listening…", "live");
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  langSel.disabled = true;
+
+  // Periodically stop & restart the recorder to flush a self-contained
+  // container (full webm/ogg with headers) that ffmpeg can decode.
+  chunkTimer = setInterval(() => {
+    if (recorder && recorder.state === "recording") {
+      recorder.stop();
+      recorder = newRecorder();
+      recorder.start();
+    }
+  }, chunkMs);
+}
+
+function stop() {
+  if (chunkTimer) { clearInterval(chunkTimer); chunkTimer = null; }
+  if (recorder && recorder.state === "recording") recorder.stop();
+  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  recorder = null;
+  mediaStream = null;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  langSel.disabled = false;
+  setStatus("idle", null);
+}
+
+startBtn.addEventListener("click", start);
+stopBtn.addEventListener("click", stop);
+</script>
+</body>
+</html>
