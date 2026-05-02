@@ -1,56 +1,54 @@
 # Twi / Igbo → English live speech translator
 
 A small web app that captures live microphone audio in Twi or Igbo,
-transcribes it with **Meta MMS** running on-device, and translates the
-transcript to English using **Claude Haiku 4.5** via the Anthropic API.
+transcribes it with **Meta MMS** (Massively Multilingual Speech, 1000+
+languages), and translates the transcript to English with **NLLB-200**.
+Everything runs on your phone — no cloud services, no API keys, no
+external accounts.
 
 ```
-mic → MediaRecorder (15s chunks) → FastAPI /transcribe
+mic → MediaRecorder (5s chunks) → FastAPI /transcribe
                                   → ffmpeg decode (16kHz mono)
-                                  → MMS speech recognition (local)
-                                  → Claude Haiku 4.5 translation (API)
+                                  → MMS speech recognition
+                                  → NLLB-200 translation
                                   → JSON {transcript, translation}
 ```
 
-Runs entirely on an Android phone using **Termux**: the FastAPI server,
-PyTorch, and the MMS model all run on the phone; the only network call
-goes from the phone to the Anthropic API for translation. Open the page
-in the phone's browser at `http://localhost:8000`.
+Browsers don't natively support Twi or Igbo speech recognition (and
+OpenAI Whisper doesn't list them either), so the heavy lifting happens
+locally via PyTorch.
 
 ## Why this stack
 
-- Browsers don't natively support Twi or Igbo speech recognition, and
-  OpenAI Whisper doesn't list either language. **MMS** covers 1100+
-  languages including `twi` and `ibo` and is the only practical free
-  option.
-- Translation could be done with NLLB-200 locally, but Claude Haiku 4.5
-  produces much more natural, context-aware English from a multi-sentence
-  Twi/Igbo transcript — and it's fast enough (typically 0.5–2 s per
-  chunk).
+- **MMS** is the only freely available ASR model with Twi (`twi`) and
+  Igbo (`ibo`) support.
+- **NLLB-200** covers both for translation.
+- Both are pure PyTorch + HuggingFace `transformers`, so the whole
+  pipeline runs offline on Termux.
 
 ## Requirements
 
-- Android phone with Termux (install from F-Droid; the Play Store build
-  is outdated)
-- ~3 GB free disk for the MMS model + PyTorch
-- An Anthropic API key (set `ANTHROPIC_API_KEY`)
+- Android phone with **Termux** — install from F-Droid; the Play Store
+  build is outdated and won't install the packages below.
+- ~3 GB free disk for the models (downloaded on first run).
+- Patience on the first request: cold model load takes 30–60 s on a
+  phone, then each ~5 s clip transcribes + translates in roughly 5–15 s.
 
 ## Termux setup (one-time)
 
 ```bash
 pkg update && pkg upgrade
-pkg install python ffmpeg git rust binutils
+pkg install python ffmpeg git
 
-# PyTorch + numpy ship as Termux packages — pip-installing them fails
-# without these.
+# PyTorch and numpy ship as Termux packages — pip-installing them from
+# source on Android is painful. Use the pkg versions.
 pkg install python-torch python-numpy
 
 git clone <this-repo> translator && cd translator
-pip install fastapi 'uvicorn[standard]' python-multipart transformers anthropic
+pip install fastapi 'uvicorn[standard]' python-multipart transformers sentencepiece
 
 # Keep model downloads inside the project so they're easy to find/delete.
 echo 'export HF_HOME=$HOME/translator/hf_cache' >> ~/.bashrc
-echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -63,36 +61,36 @@ uvicorn server:app --host 127.0.0.1 --port 8000
 
 Open `http://localhost:8000` in the phone's browser, pick **Twi** or
 **Igbo**, tap **Start**, and talk. The first request triggers a one-time
-MMS download (~2.5 GB) and warmup; subsequent chunks transcribe in a few
-seconds and translate in ~1 second.
-
-The default 15-second chunk gives Claude enough context to produce
-fluent translations across sentence boundaries; drop to 5 s if you'd
-rather see English text appear sooner at the cost of choppier phrasing.
+model download (~2.5 GB total: MMS ~1 GB, NLLB ~600 MB plus tokenizers).
 
 ## Notes & honest limits
 
-- **Low-resource speech recognition.** Twi and Igbo have far less
-  training data than English/Spanish/Mandarin. Expect transcription
-  errors — especially with background noise, multiple speakers, or
-  heavy code-switching. Claude often makes the English readable even
-  when the MMS transcript has minor errors, but garbage in still means
-  garbage out.
-- **Phone CPU is the bottleneck.** MMS is ~1B params; a 15-second clip
-  takes roughly 5–15 s to transcribe on a modern phone. Translation is
-  fast.
-- **Privacy.** Audio never leaves the phone. The Twi/Igbo *transcript*
-  is sent to the Anthropic API for translation — be aware of that if
-  the content is sensitive.
+- **Low-resource languages.** Twi and Igbo have far less training data
+  than English/Spanish/Mandarin. Expect transcription errors — especially
+  with background noise, multiple speakers, or heavy code-switching.
+- **NLLB-distilled-600M** is small and produces serviceable but
+  sometimes literal translations. The full NLLB-3.3B is much better but
+  too large for a phone.
+- **Near-live, not streaming.** Audio is sent in self-contained 3–8
+  second chunks (the page restarts the `MediaRecorder` on each interval
+  so each blob has full container headers — required for ffmpeg to
+  decode it). True word-by-word streaming would need a different model
+  architecture and a WebSocket protocol.
+- **Phone CPU is the bottleneck.** No cloud, no GPU. Each chunk takes
+  several seconds; consider using larger chunks (8 s) to reduce
+  per-chunk overhead.
+- **Privacy.** Nothing leaves the phone — no API calls of any kind.
+
+## Models used
+
+- Speech: [`facebook/mms-1b-all`](https://huggingface.co/facebook/mms-1b-all)
+- Translation: [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M)
 
 ## Adding more languages
 
-MMS supports 1100+ languages. To add e.g. Yoruba:
+MMS supports 1100+ languages and NLLB supports 200. To add e.g. Yoruba:
 
-1. Add `"yor": "yor"` to `MMS_LANG` and `"yor": "Yoruba"` to `LANG_NAME`
-   in `server.py`.
-2. Add `<option value="yor">Yoruba</option>` to the `<select id="lang">`
+1. Add `"yor": "yor"` to `MMS_LANG` in `server.py`.
+2. Add `"yor": "yor_Latn"` to `NLLB_SRC`.
+3. Add `<option value="yor">Yoruba</option>` to the `<select id="lang">`
    in `static/index.html`.
-
-Claude already understands hundreds of languages, so the translation
-side needs no changes.

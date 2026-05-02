@@ -3,5 +3,5 @@ uvicorn[standard]>=0.27
 python-multipart>=0.0.9
 torch>=2.2
 transformers>=4.41
+sentencepiece>=0.2
 numpy>=1.26
-anthropic>=0.40

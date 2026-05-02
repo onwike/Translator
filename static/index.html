@@ -116,7 +116,7 @@
 <body>
 <header>
   <h1>Twi / Igbo → English live translator</h1>
-  <p>Speak in Twi or Igbo. Audio is captured in short chunks, transcribed with Meta MMS on-device, and translated with Claude Haiku.</p>
+  <p>Speak in Twi or Igbo. Audio is captured in short chunks, transcribed with Meta MMS, and translated with NLLB-200.</p>
 </header>
 
 <main>
@@ -129,10 +129,9 @@
 
     <label for="chunk">Chunk size</label>
     <select id="chunk">
-      <option value="5000">5 s</option>
-      <option value="10000">10 s</option>
-      <option value="15000" selected>15 s</option>
-      <option value="20000">20 s</option>
+      <option value="3000">3 s</option>
+      <option value="5000" selected>5 s</option>
+      <option value="8000">8 s</option>
     </select>
 
     <button id="start" class="primary">Start</button>

@@ -1,46 +1,47 @@
-"""FastAPI server: transcribe Twi/Igbo audio and translate to English with Claude.
+"""FastAPI server: transcribe Twi/Igbo audio and translate to English.
 
 Pipeline:
   audio bytes (webm/ogg/wav) -> 16kHz mono float32 (ffmpeg)
                               -> MMS speech recognition (Twi or Igbo)
-                              -> Claude Haiku 4.5 translation to English
+                              -> NLLB-200 translation to English
 """
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-import anthropic
 import numpy as np
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoProcessor, Wav2Vec2ForCTC
+from transformers import (
+    AutoModelForSeq2SeqLM,
+    AutoProcessor,
+    AutoTokenizer,
+    Wav2Vec2ForCTC,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("translator")
 
 LangCode = Literal["twi", "ibo"]
 
+# MMS uses ISO 639-3 codes for its target language adapter.
 MMS_LANG = {"twi": "twi", "ibo": "ibo"}
-LANG_NAME = {"twi": "Twi (Akan)", "ibo": "Igbo"}
+
+# NLLB-200 uses BCP-47-ish FLORES codes.
+NLLB_SRC = {"twi": "twi_Latn", "ibo": "ibo_Latn"}
+NLLB_TGT = "eng_Latn"
 
 MMS_MODEL_ID = "facebook/mms-1b-all"
-CLAUDE_MODEL = "claude-haiku-4-5"
+NLLB_MODEL_ID = "facebook/nllb-200-distilled-600M"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-SYSTEM_PROMPT = (
-    "You are a professional translator. Translate the user's message from {language} "
-    "into natural, fluent English. Output ONLY the English translation — no preamble, "
-    "no explanations, no quotes, no commentary. Preserve meaning and tone faithfully. "
-    "If the input is empty, fragmentary, or unintelligible, respond with an empty string."
-)
+DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 
 @lru_cache(maxsize=1)
@@ -53,13 +54,14 @@ def _mms():
 
 
 @lru_cache(maxsize=1)
-def _claude() -> anthropic.Anthropic:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Export it before starting the server: "
-            "export ANTHROPIC_API_KEY=sk-ant-..."
-        )
-    return anthropic.Anthropic()
+def _nllb():
+    log.info("Loading NLLB model %s on %s", NLLB_MODEL_ID, DEVICE)
+    tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL_ID)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        NLLB_MODEL_ID, torch_dtype=DTYPE
+    ).to(DEVICE)
+    model.eval()
+    return tokenizer, model
 
 
 def decode_audio(raw: bytes) -> np.ndarray:
@@ -81,6 +83,7 @@ def decode_audio(raw: bytes) -> np.ndarray:
 def transcribe_mms(audio: np.ndarray, lang: LangCode) -> str:
     processor, model = _mms()
     target = MMS_LANG[lang]
+    # MMS exposes a per-language adapter that swaps both tokenizer and CTC head.
     processor.tokenizer.set_target_lang(target)
     model.load_adapter(target)
     inputs = processor(audio, sampling_rate=16000, return_tensors="pt").to(DEVICE)
@@ -90,31 +93,21 @@ def transcribe_mms(audio: np.ndarray, lang: LangCode) -> str:
     return processor.batch_decode(pred_ids)[0].strip()
 
 
-def translate_with_claude(text: str, lang: LangCode) -> str:
+def translate_nllb(text: str, lang: LangCode) -> str:
     if not text:
         return ""
-    client = _claude()
-    try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT.format(language=LANG_NAME[lang]),
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": text}],
+    tokenizer, model = _nllb()
+    tokenizer.src_lang = NLLB_SRC[lang]
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(DEVICE)
+    forced_bos = tokenizer.convert_tokens_to_ids(NLLB_TGT)
+    with torch.inference_mode():
+        out = model.generate(
+            **inputs,
+            forced_bos_token_id=forced_bos,
+            max_new_tokens=256,
+            num_beams=2,
         )
-    except anthropic.APIStatusError as e:
-        log.warning("Claude API error: %s", e)
-        raise HTTPException(502, f"Claude translation failed: {e.message}") from e
-
-    return next(
-        (b.text.strip() for b in response.content if b.type == "text"),
-        "",
-    )
+    return tokenizer.batch_decode(out, skip_special_tokens=True)[0].strip()
 
 
 app = FastAPI(title="Twi/Igbo → English live translator")
@@ -130,7 +123,7 @@ def index():
 
 @app.get("/healthz")
 def health():
-    return {"status": "ok", "device": DEVICE, "claude_model": CLAUDE_MODEL}
+    return {"status": "ok", "device": DEVICE}
 
 
 @app.post("/transcribe")
@@ -145,13 +138,14 @@ async def transcribe(
     if samples.size < 16000 * 0.3:  # < 0.3s of audio
         return {"transcript": "", "translation": ""}
     transcript = transcribe_mms(samples, lang)
-    translation = translate_with_claude(transcript, lang)
+    translation = translate_nllb(transcript, lang)
     log.info("[%s] %r -> %r", lang, transcript, translation)
     return {"transcript": transcript, "translation": translation}
 
 
 @app.on_event("startup")
 def warmup():
-    _claude()  # Fail fast if ANTHROPIC_API_KEY is missing.
+    # Pre-load both models so the first request isn't a 30s cold-start.
     _mms()
-    log.info("MMS loaded, Claude client ready (%s).", CLAUDE_MODEL)
+    _nllb()
+    log.info("Models loaded; ready.")
