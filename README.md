@@ -38,7 +38,7 @@ locally via PyTorch.
 
 ```bash
 pkg update && pkg upgrade
-pkg install python ffmpeg git
+pkg install python ffmpeg git rust binutils
 
 # PyTorch and numpy ship as Termux packages — pip-installing them from
 # source on Android is painful. Use the pkg versions.
@@ -51,6 +51,11 @@ pip install fastapi uvicorn python-multipart transformers sentencepiece
 echo 'export HF_HOME=$HOME/translator/hf_cache' >> ~/.bashrc
 source ~/.bashrc
 ```
+
+> The `transformers` install builds `tokenizers` from source (it's a Rust
+> crate with no Android wheel). Expect 5–15 minutes and a lot of RAM.
+> If the build crashes with OOM, retry with `CARGO_BUILD_JOBS=1 pip
+> install transformers`.
 
 ## Run
 
