@@ -45,7 +45,7 @@ pkg install python ffmpeg git
 pkg install python-torch python-numpy
 
 git clone <this-repo> translator && cd translator
-pip install fastapi 'uvicorn[standard]' python-multipart transformers sentencepiece
+pip install fastapi uvicorn python-multipart transformers sentencepiece
 
 # Keep model downloads inside the project so they're easy to find/delete.
 echo 'export HF_HOME=$HOME/translator/hf_cache' >> ~/.bashrc
