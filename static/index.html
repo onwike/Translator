@@ -116,7 +116,7 @@
 <body>
 <header>
   <h1>Twi / Igbo → English live translator</h1>
-  <p>Speak in Twi or Igbo. Audio is captured in short chunks, transcribed with Meta MMS, and translated with NLLB-200.</p>
+  <p>Speak in Twi or Igbo. Audio streams in 500&nbsp;ms frames; partial results appear immediately and revise themselves as you speak.</p>
 </header>
 
 <main>
@@ -127,11 +127,10 @@
       <option value="ibo">Igbo</option>
     </select>
 
-    <label for="chunk">Chunk size</label>
-    <select id="chunk">
-      <option value="3000">3 s</option>
-      <option value="5000" selected>5 s</option>
-      <option value="8000">8 s</option>
+    <label for="mode">Mode</label>
+    <select id="mode">
+      <option value="local" selected>On-device streaming</option>
+      <option value="grok">Grok Live (experimental)</option>
     </select>
 
     <button id="start" class="primary">Start</button>
@@ -156,20 +155,30 @@
 </main>
 
 <footer>
-  Browser must allow microphone access. Twi and Igbo are low-resource languages — accuracy is best with clear speech, one speaker, no background noise.
+  Browser must allow microphone access. Twi and Igbo are low-resource languages — accuracy
+  is best with clear speech, one speaker, no background noise. Grok Live streams your audio
+  to xAI and is experimental: neither language is on Grok&rsquo;s official list.
 </footer>
 
 <script>
 const $ = (id) => document.getElementById(id);
 const startBtn = $("start"), stopBtn = $("stop");
-const langSel = $("lang"), chunkSel = $("chunk");
+const langSel = $("lang"), modeSel = $("mode");
 const dot = $("dot"), statusText = $("statusText");
 const originalEl = $("original"), englishEl = $("english");
 
-let mediaStream = null;
-let recorder = null;
-let chunkTimer = null;
-let inflight = 0;
+const TARGET_RATE = 16000;
+const FRAME_SECONDS = 0.5;
+
+let audioCtx = null, workletNode = null, mediaStream = null;
+let localWS = null, grokWS = null;
+let running = false;
+let stopTimer = null;
+let grokText = "";  // accumulates response text deltas
+
+// Replace-in-place partial line per pane.
+const origState = { p: null };
+const engState = { p: null };
 
 function setStatus(text, kind) {
   statusText.textContent = text;
@@ -184,103 +193,273 @@ function appendLine(el, text) {
   el.scrollTop = el.scrollHeight;
 }
 
-async function sendChunk(blob) {
-  if (!blob || blob.size < 1000) return;
-  inflight++;
-  setStatus(`processing (${inflight})…`, "busy");
-  const fd = new FormData();
-  fd.append("audio", blob, "chunk.webm");
-  fd.append("lang", langSel.value);
-  try {
-    const res = await fetch("/transcribe", { method: "POST", body: fd });
-    if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
-    appendLine(originalEl, data.transcript);
-    appendLine(englishEl, data.translation);
-  } catch (err) {
-    console.error(err);
-    appendLine(englishEl, "[error: " + err.message + "]");
-  } finally {
-    inflight--;
-    setStatus(recorder && recorder.state === "recording"
-      ? (inflight ? `processing (${inflight})…` : "listening…")
-      : "idle",
-      recorder && recorder.state === "recording"
-        ? (inflight ? "busy" : "live")
-        : null);
+function updatePartial(pane, state, text) {
+  if (!text) return;
+  if (!state.p) {
+    state.p = document.createElement("p");
+    state.p.className = "partial";
+    pane.appendChild(state.p);
   }
+  state.p.textContent = text;
+  pane.scrollTop = pane.scrollHeight;
 }
 
-function pickMimeType() {
-  const candidates = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/ogg;codecs=opus",
-    "audio/mp4",
-  ];
-  for (const t of candidates) {
-    if (MediaRecorder.isTypeSupported(t)) return t;
-  }
-  return "";
-}
-
-async function start() {
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (err) {
-    setStatus("mic denied", null);
-    alert("Could not access microphone: " + err.message);
+function finalizePartial(pane, state, text) {
+  if (!state.p) {
+    appendLine(pane, text);
     return;
   }
-  const mimeType = pickMimeType();
-  const chunkMs = parseInt(chunkSel.value, 10);
-  let parts = [];
+  if (text) state.p.textContent = text;
+  if (state.p.textContent) {
+    state.p.className = "";
+  } else {
+    state.p.remove();
+  }
+  state.p = null;
+  pane.scrollTop = pane.scrollHeight;
+}
 
-  const newRecorder = () => {
-    const r = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
-    r.ondataavailable = (e) => { if (e.data && e.data.size) parts.push(e.data); };
-    r.onstop = () => {
-      if (parts.length) {
-        const blob = new Blob(parts, { type: parts[0].type || mimeType || "audio/webm" });
-        parts = [];
-        sendChunk(blob);
+// ---------- audio capture: AudioWorklet -> 500 ms PCM16 mono frames ----------
+
+const WORKLET_SOURCE = `
+class PCMCapture extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.frameLen = Math.round(sampleRate * ${FRAME_SECONDS});
+    this.chunks = [];
+    this.length = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch && ch.length) {
+      this.chunks.push(new Float32Array(ch));
+      this.length += ch.length;
+      if (this.length >= this.frameLen) {
+        const all = new Float32Array(this.length);
+        let off = 0;
+        for (const c of this.chunks) { all.set(c, off); off += c.length; }
+        this.chunks = [];
+        this.length = 0;
+        this.port.postMessage(all, [all.buffer]);
       }
-    };
-    return r;
-  };
+    }
+    return true;
+  }
+}
+registerProcessor("pcm-capture", PCMCapture);
+`;
 
-  recorder = newRecorder();
-  recorder.start();
-  setStatus("listening…", "live");
+function resampleTo16k(f32, fromRate) {
+  if (fromRate === TARGET_RATE) return f32;
+  const outLen = Math.round(f32.length * TARGET_RATE / fromRate);
+  const out = new Float32Array(outLen);
+  const ratio = (f32.length - 1) / Math.max(1, outLen - 1);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio;
+    const lo = Math.floor(pos), hi = Math.min(lo + 1, f32.length - 1);
+    out[i] = f32[lo] + (f32[hi] - f32[lo]) * (pos - lo);
+  }
+  return out;
+}
+
+function floatToPCM16(f32) {
+  const out = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return out;
+}
+
+function pcm16ToBase64(int16) {
+  const bytes = new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength);
+  let bin = "";
+  const STEP = 0x8000;
+  for (let i = 0; i < bytes.length; i += STEP) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + STEP));
+  }
+  return btoa(bin);
+}
+
+async function startCapture(onFrame) {
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  });
+  try {
+    audioCtx = new AudioContext({ sampleRate: TARGET_RATE });
+  } catch (_) {
+    audioCtx = new AudioContext(); // some browsers reject a fixed rate; resample below
+  }
+  const url = URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "text/javascript" }));
+  await audioCtx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+  const src = audioCtx.createMediaStreamSource(mediaStream);
+  workletNode = new AudioWorkletNode(audioCtx, "pcm-capture");
+  workletNode.port.onmessage = (e) => {
+    if (!running) return;
+    onFrame(floatToPCM16(resampleTo16k(e.data, audioCtx.sampleRate)));
+  };
+  src.connect(workletNode);
+  workletNode.connect(audioCtx.destination); // keeps the node pulled; outputs silence
+}
+
+function stopCapture() {
+  if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+}
+
+// ---------- mode 1: on-device streaming over our own WebSocket ----------
+
+function startLocal(lang) {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  localWS = new WebSocket(`${proto}://${location.host}/ws/transcribe?lang=${lang}`);
+  localWS.binaryType = "arraybuffer";
+  localWS.onmessage = (e) => {
+    let m;
+    try { m = JSON.parse(e.data); } catch (_) { return; }
+    if (m.partial) {
+      updatePartial(originalEl, origState, m.transcript);
+      updatePartial(englishEl, engState, m.translation);
+    } else {
+      finalizePartial(originalEl, origState, m.transcript);
+      finalizePartial(englishEl, engState, m.translation);
+    }
+    if (running) setStatus(`listening… (${m.engine})`, "live");
+  };
+  localWS.onerror = () => appendLine(englishEl, "[connection error]");
+  localWS.onclose = () => { localWS = null; if (!running) teardown(); };
+}
+
+function sendLocalFrame(int16) {
+  if (localWS && localWS.readyState === WebSocket.OPEN) localWS.send(int16.buffer);
+}
+
+// ---------- mode 2: Grok Live (browser -> xAI realtime WebSocket) ----------
+
+async function startGrok(lang) {
+  const res = await fetch("/grok-live/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lang }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const cfg = await res.json();
+  grokWS = new WebSocket(
+    `wss://api.x.ai/v1/realtime?model=${encodeURIComponent(cfg.model)}`,
+    ["xai-client-secret." + cfg.token]
+  );
+  grokWS.onopen = () => {
+    grokWS.send(JSON.stringify({ type: "session.update", session: cfg.session }));
+    setStatus("listening… (grok live)", "live");
+  };
+  grokWS.onmessage = handleGrokEvent;
+  grokWS.onerror = () => appendLine(englishEl, "[grok connection error]");
+  grokWS.onclose = (e) => {
+    grokWS = null;
+    if (running) {
+      appendLine(englishEl, `[grok session closed${e.reason ? ": " + e.reason : ""}]`);
+      stop();
+    }
+  };
+}
+
+function handleGrokEvent(e) {
+  let m;
+  try { m = JSON.parse(e.data); } catch (_) { return; }
+  const t = m.type || "";
+  const isResponseText = t.startsWith("response.output_text") || t.startsWith("response.text")
+    || t.includes("audio_transcript");
+  if (t === "conversation.item.input_audio_transcription.updated") {
+    // xAI sends cumulative transcripts, not deltas.
+    updatePartial(originalEl, origState, m.transcript || m.delta || "");
+  } else if (t === "conversation.item.input_audio_transcription.completed") {
+    finalizePartial(originalEl, origState, m.transcript || "");
+  } else if (isResponseText && t.endsWith(".delta")) {
+    grokText += m.delta || "";
+    updatePartial(englishEl, engState, grokText);
+  } else if (isResponseText && (t.endsWith(".done") || t.endsWith(".completed"))) {
+    finalizePartial(englishEl, engState, m.text || m.transcript || grokText);
+    grokText = "";
+  } else if (t === "error") {
+    appendLine(englishEl, "[grok error: " + JSON.stringify(m.error || m) + "]");
+  }
+}
+
+function sendGrokFrame(int16) {
+  if (grokWS && grokWS.readyState === WebSocket.OPEN) {
+    grokWS.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      audio: pcm16ToBase64(int16),
+    }));
+  }
+}
+
+// ---------- start / stop ----------
+
+async function start() {
+  const lang = langSel.value, mode = modeSel.value;
   startBtn.disabled = true;
+  try {
+    if (mode === "grok") {
+      await startGrok(lang);
+    } else {
+      startLocal(lang);
+    }
+    await startCapture(mode === "grok" ? sendGrokFrame : sendLocalFrame);
+  } catch (err) {
+    setStatus("error", null);
+    appendLine(englishEl, "[start failed: " + err.message + "]");
+    stopCapture();
+    if (localWS) { localWS.close(); localWS = null; }
+    if (grokWS) { grokWS.close(); grokWS = null; }
+    startBtn.disabled = false;
+    return;
+  }
+  running = true;
+  setStatus("listening…", "live");
   stopBtn.disabled = false;
   langSel.disabled = true;
-
-  // Periodically stop & restart the recorder to flush a self-contained
-  // container (full webm/ogg with headers) that ffmpeg can decode.
-  chunkTimer = setInterval(() => {
-    if (recorder && recorder.state === "recording") {
-      recorder.stop();
-      recorder = newRecorder();
-      recorder.start();
-    }
-  }, chunkMs);
+  modeSel.disabled = true;
 }
 
 function stop() {
-  if (chunkTimer) { clearInterval(chunkTimer); chunkTimer = null; }
-  if (recorder && recorder.state === "recording") recorder.stop();
-  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-  recorder = null;
-  mediaStream = null;
+  running = false;
+  stopCapture();
+  grokText = "";
+  if (grokWS) { grokWS.close(); grokWS = null; }
+  if (localWS && localWS.readyState === WebSocket.OPEN) {
+    // Ask the server to finalize whatever is buffered; it closes when done.
+    localWS.send(JSON.stringify({ type: "flush" }));
+    setStatus("finishing…", "busy");
+    stopTimer = setTimeout(() => { if (localWS) localWS.close(); }, 8000);
+  } else {
+    teardown();
+  }
+}
+
+function teardown() {
+  if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+  finalizePartial(originalEl, origState, "");
+  finalizePartial(englishEl, engState, "");
   startBtn.disabled = false;
   stopBtn.disabled = true;
   langSel.disabled = false;
+  modeSel.disabled = false;
   setStatus("idle", null);
 }
 
 startBtn.addEventListener("click", start);
 stopBtn.addEventListener("click", stop);
+
+// Disable Grok Live when the server has no XAI_API_KEY.
+fetch("/healthz").then(r => r.json()).then(h => {
+  if (!h.grok) {
+    const opt = modeSel.querySelector('option[value="grok"]');
+    opt.disabled = true;
+    opt.textContent = "Grok Live (needs XAI_API_KEY)";
+  }
+}).catch(() => {});
 </script>
 </body>
 </html>
